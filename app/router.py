@@ -846,7 +846,7 @@ footer{{border-top:1px solid var(--border);padding:1rem 1.5rem;
     <!-- Charts -->
     <div class="grid2 mb">
       <div class="card">
-        <div class="ch"><div class="ct"><span class="ctbar"></span>配信頻度 分布</div></div>
+        <div class="ch"><div class="ct"><span class="ctbar"></span>直近7日間 配信実績</div></div>
         <div class="cbox"><canvas id="freqChart" height="150"></canvas></div>
       </div>
       <div class="card">
@@ -1159,7 +1159,6 @@ async function loadSubs() {{
     $('st-active').textContent = active.length;
     $('st-due').textContent    = due.length;
 
-    updateFreqChart(all);
     updateIntensChart(all);
 
     const list = $('sub-list');
@@ -1366,6 +1365,13 @@ async function loadHistStats() {{
     $('hs-themes').textContent= d.unique_themes;
     $('hs-last').textContent  = d.last_sent_at ? fmtDate(d.last_sent_at) : '—';
   }} catch {{}}
+  /* 配信実績チャート用に直近履歴を取得して描画 */
+  try {{
+    const hr = await fetch('/v1/history?limit=500');
+    const records = await hr.json();
+    historyData = records;
+    updateDeliveryChart(records);
+  }} catch {{}}
 }}
 
 async function loadHistory() {{
@@ -1404,20 +1410,45 @@ function renderHistory(data, status) {{
 }}
 
 /* ── Charts ───────────────────────────────────────────────────── */
-function updateFreqChart(subs) {{
-  const cnt = {{hourly:0,daily:0,weekly:0,monthly:0}};
-  subs.filter(s=>s.active).forEach(s => cnt[s.frequency]=(cnt[s.frequency]||0)+1);
-  const labels = Object.keys(cnt).filter(k=>cnt[k]>0);
-  const data   = labels.map(l=>cnt[l]);
-  const colors = {{hourly:'#a78bfa',daily:'#38bdf8',weekly:'#34d399',monthly:'#fb923c'}};
-  const cdata  = {{labels,datasets:[{{data,backgroundColor:labels.map(l=>colors[l]),borderWidth:0}}]}};
-  const opts   = {{responsive:true,plugins:{{
-    legend:{{position:'right',labels:{{color:'#94a3b8',font:{{size:11}}}}}},
-    tooltip:{{callbacks:{{label:c=>` ${{c.label}}: ${{c.raw}}件`}}}}
-  }}}};
-  if (freqChart) {{ freqChart.data=cdata; freqChart.update(); return; }}
+function updateDeliveryChart(records) {{
+  /* 直近7日間（今日含む）の配信成功/失敗を積み上げ棒グラフで表示 */
+  const now = Date.now();
+  const days = [], successArr = [], failArr = [];
+  for (let i = 6; i >= 0; i--) {{
+    const d = new Date(now - i * 86400000);
+    days.push((d.getMonth()+1) + '/' + d.getDate());
+    successArr.push(0);
+    failArr.push(0);
+  }}
+  records.forEach(r => {{
+    const d = new Date(r.sent_at * 1000);
+    const label = (d.getMonth()+1) + '/' + d.getDate();
+    const idx = days.indexOf(label);
+    if (idx < 0) return;
+    if (r.success) successArr[idx]++; else failArr[idx]++;
+  }});
+  const cdata = {{
+    labels: days,
+    datasets: [
+      {{label:'成功', data:successArr, backgroundColor:'rgba(16,185,129,.75)', borderRadius:4, borderSkipped:false}},
+      {{label:'失敗', data:failArr,    backgroundColor:'rgba(239,68,68,.7)',   borderRadius:4, borderSkipped:false}}
+    ]
+  }};
+  const opts = {{
+    responsive:true,
+    plugins:{{
+      legend:{{position:'top',labels:{{color:'#94a3b8',font:{{size:11}},boxWidth:12}}}},
+      tooltip:{{callbacks:{{label:c=>` ${{c.dataset.label}}: ${{c.raw}}件`}}}}
+    }},
+    scales:{{
+      x:{{stacked:true,grid:{{color:'rgba(255,255,255,.04)'}},ticks:{{color:'#64748b'}}}},
+      y:{{stacked:true,beginAtZero:true,grid:{{color:'rgba(255,255,255,.04)'}},
+         ticks:{{color:'#64748b',stepSize:1,precision:0}}}}
+    }}
+  }};
+  if (freqChart) {{ freqChart.data=cdata; freqChart.options=opts; freqChart.update(); return; }}
   Chart.defaults.color='#64748b';
-  freqChart = new Chart($('freqChart').getContext('2d'),{{type:'doughnut',data:cdata,options:opts}});
+  freqChart = new Chart($('freqChart').getContext('2d'),{{type:'bar',data:cdata,options:opts}});
 }}
 
 function updateIntensChart(subs) {{
