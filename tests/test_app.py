@@ -264,7 +264,7 @@ def client():
 
 class TestHealthEndpoint:
     def test_healthz(self, client) -> None:
-        resp = client.get("/healthz")
+        resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
