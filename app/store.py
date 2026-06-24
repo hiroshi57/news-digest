@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sqlite3
 import time
 import uuid
@@ -31,6 +32,26 @@ class Store:
         if db_path == ":memory:":
             self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._shared_conn.row_factory = sqlite3.Row
+        else:
+            # ファイルパスの場合、ディレクトリが無ければ作成
+            parent = pathlib.Path(db_path).parent
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            # 書き込みテスト: 失敗したら :memory: にフォールバック
+            try:
+                test_conn = sqlite3.connect(db_path)
+                test_conn.close()
+            except sqlite3.OperationalError:
+                import warnings
+                warnings.warn(
+                    f"Cannot open SQLite DB at '{db_path}', falling back to :memory:",
+                    RuntimeWarning, stacklevel=2,
+                )
+                self.db_path = ":memory:"
+                self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._shared_conn.row_factory = sqlite3.Row
         self._init_db()
 
     def close(self) -> None:
