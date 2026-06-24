@@ -5,6 +5,9 @@ uvicorn[standard]>=0.29.0
 # Pydantic v2 (FastAPI 0.111+ 同梱)
 pydantic>=2.7.0
 
+# 認証トークン署名（マジックリンク + セッション Cookie）
+itsdangerous>=2.1.0
+
 # News search
 # ddgs (旧 duckduckgo-search) を優先使用。jp-jp region は v0.x 系が対応
 ddgs>=0.1.0

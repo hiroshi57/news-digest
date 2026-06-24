@@ -59,6 +59,7 @@ class Subscription:
     created_at:  float        = field(default_factory=time.time)
     last_sent_at: Optional[float] = None
     tags:        List[str]    = field(default_factory=list)
+    owner_email: str          = ""   # 登録者（ログインユーザー）のメールアドレス
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +67,7 @@ class Subscription:
             "frequency": self.frequency, "count": self.count,
             "active": self.active, "created_at": self.created_at,
             "last_sent_at": self.last_sent_at, "tags": self.tags,
+            "owner_email": self.owner_email,
         }
 
 

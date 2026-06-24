@@ -7,9 +7,20 @@ import socket
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from .auth import (
+    SESSION_COOKIE,
+    SESSION_EXPIRES,
+    get_session_email,
+    is_admin,
+    magic_link_email_body,
+    magic_link_url,
+    make_magic_token,
+    make_session_token,
+    verify_magic_token,
+)
 from .models import DeliveryFrequency
 from .summarizer import DEFAULT_MAX_CHARS
 
@@ -112,8 +123,17 @@ def _engine(req: Request):
 # 購読 CRUD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _require_login(req: Request) -> str:
+    """セッションからメールアドレスを取得する。未ログインなら 401。"""
+    email = get_session_email(req)
+    if not email:
+        raise HTTPException(401, "ログインが必要です。/login からログインしてください。")
+    return email
+
+
 @router.post("/v1/subscriptions", tags=["subscriptions"])
 def create_subscription(req: Request, body: SubscriptionCreate):
+    owner = _require_login(req)
     try:
         DeliveryFrequency.from_str(body.frequency)
     except ValueError as e:
@@ -124,27 +144,41 @@ def create_subscription(req: Request, body: SubscriptionCreate):
     sub = _store(req).create(
         theme=body.theme, email=body.email,
         frequency=body.frequency, count=body.count, tags=body.tags,
+        owner_email=owner,
     )
     return sub.to_dict()
 
 
 @router.get("/v1/subscriptions", tags=["subscriptions"])
 def list_subscriptions(req: Request):
-    return [s.to_dict() for s in _store(req).list_all()]
+    owner = _require_login(req)
+    # 管理者は全件、一般ユーザーは自分の購読のみ
+    if is_admin(owner):
+        subs = _store(req).list_all()
+    else:
+        subs = _store(req).list_all(owner=owner)
+    return [s.to_dict() for s in subs]
 
 
 @router.get("/v1/subscriptions/{sub_id}", tags=["subscriptions"])
 def get_subscription(req: Request, sub_id: str):
+    owner = _require_login(req)
     sub = _store(req).get(sub_id)
     if not sub:
         raise HTTPException(404, f"購読が見つかりません: {sub_id}")
+    if not is_admin(owner) and sub.owner_email != owner:
+        raise HTTPException(403, "この購読へのアクセス権がありません")
     return sub.to_dict()
 
 
 @router.patch("/v1/subscriptions/{sub_id}", tags=["subscriptions"])
 def update_subscription(req: Request, sub_id: str, body: SubscriptionUpdate):
-    if not _store(req).get(sub_id):
+    owner = _require_login(req)
+    sub = _store(req).get(sub_id)
+    if not sub:
         raise HTTPException(404, f"購読が見つかりません: {sub_id}")
+    if not is_admin(owner) and sub.owner_email != owner:
+        raise HTTPException(403, "この購読を編集する権限がありません")
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
     if "frequency" in fields:
         try:
@@ -161,8 +195,13 @@ def update_subscription(req: Request, sub_id: str, body: SubscriptionUpdate):
 
 @router.delete("/v1/subscriptions/{sub_id}", tags=["subscriptions"])
 def delete_subscription(req: Request, sub_id: str):
-    if not _store(req).delete(sub_id):
+    owner = _require_login(req)
+    sub = _store(req).get(sub_id)
+    if not sub:
         raise HTTPException(404, f"購読が見つかりません: {sub_id}")
+    if not is_admin(owner) and sub.owner_email != owner:
+        raise HTTPException(403, "この購読を削除する権限がありません")
+    _store(req).delete(sub_id)
     return {"deleted": True, "id": sub_id}
 
 
@@ -170,7 +209,12 @@ def delete_subscription(req: Request, sub_id: str):
 
 @router.post("/v1/subscriptions/bulk", tags=["subscriptions"])
 def bulk_action(req: Request, body: BulkAction):
+    owner = _require_login(req)
     store = _store(req)
+    # 管理者以外は自分の購読のみ対象
+    if not is_admin(owner):
+        owned = {s.id for s in store.list_all(owner=owner)}
+        body.ids = [i for i in body.ids if i in owned]
     if body.action == "pause":
         n = store.bulk_update(body.ids, active=0)
         return {"action": "pause", "updated": n}
@@ -187,14 +231,29 @@ def bulk_action(req: Request, body: BulkAction):
 
 @router.get("/v1/subscriptions/export/json", tags=["subscriptions"])
 def export_subscriptions(req: Request):
-    return {"data": _store(req).export_json()}
+    owner = _require_login(req)
+    subs = _store(req).list_all() if is_admin(owner) else _store(req).list_all(owner=owner)
+    import json as _json
+    return {"data": _json.dumps([s.to_dict() for s in subs], ensure_ascii=False, indent=2)}
 
 
 @router.post("/v1/subscriptions/import/json", tags=["subscriptions"])
 def import_subscriptions(req: Request, body: ImportRequest):
+    owner = _require_login(req)
     try:
-        n = _store(req).import_json(body.data)
-        return {"imported": n}
+        import json as _json
+        items = _json.loads(body.data)
+        count = 0
+        for item in items:
+            if "theme" in item and "email" in item:
+                _store(req).create(
+                    theme=item["theme"], email=item["email"],
+                    frequency=item.get("frequency", "daily"),
+                    count=item.get("count", 5), tags=item.get("tags", []),
+                    owner_email=owner,
+                )
+                count += 1
+        return {"imported": count}
     except Exception as e:
         raise HTTPException(400, f"インポートに失敗しました: {e}")
 
@@ -272,8 +331,91 @@ def validate_email(body: EmailValidateRequest):
 # ダッシュボード HTML
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 認証ルート（マジックリンク）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def login_page(req: Request, sent: str = "", error: str = ""):
+    email = get_session_email(req)
+    if email:
+        return RedirectResponse("/dashboard", status_code=303)
+    return HTMLResponse(_build_login_html(sent=sent, error=error))
+
+
+@router.post("/login", include_in_schema=False)
+async def login_post(req: Request):
+    form = await req.form()
+    email = str(form.get("email", "")).strip().lower()
+    err = _check_email(email)
+    if err:
+        return HTMLResponse(_build_login_html(sent="", error=err))
+
+    token = make_magic_token(email)
+    link  = magic_link_url(req, token)
+    subject, body = magic_link_email_body(link)
+
+    mailer = req.app.state.mailer
+    if mailer.is_configured:
+        try:
+            mailer.send(email, subject, body)
+        except Exception as exc:
+            return HTMLResponse(_build_login_html(
+                sent="",
+                error=f"メール送信に失敗しました: {exc}",
+            ))
+    else:
+        # 開発環境: リンクをログに出力（コンソール確認用）
+        import logging
+        logging.getLogger(__name__).warning("MAGIC LINK (SMTP未設定): %s", link)
+
+    return RedirectResponse(f"/login?sent=1", status_code=303)
+
+
+@router.get("/auth/verify", include_in_schema=False)
+def auth_verify(req: Request, token: str = ""):
+    email = verify_magic_token(token)
+    if not email:
+        return RedirectResponse("/login?error=expired", status_code=303)
+
+    session_token = make_session_token(email)
+    response = RedirectResponse("/dashboard", status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_token,
+        max_age=SESSION_EXPIRES,
+        httponly=True,
+        samesite="lax",
+        secure=str(req.url).startswith("https"),
+    )
+    return response
+
+
+@router.get("/logout", include_in_schema=False)
+def logout():
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ダッシュボード HTML
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 def dashboard(req: Request):
+    email = get_session_email(req)
+    if not email:
+        return RedirectResponse("/login", status_code=303)
+
+    admin_flag = is_admin(email)
+    admin_badge = (
+        '<span style="background:var(--brand);color:#fff;'
+        'font-size:.7rem;padding:.15rem .55rem;border-radius:5px;'
+        'margin-right:.4rem;font-weight:600;">ADMIN</span>'
+        if admin_flag else ""
+    )
+
     freq_opts = "".join(
         f'<option value="{f.value}">{f.value}</option>'
         for f in DeliveryFrequency
@@ -284,6 +426,8 @@ def dashboard(req: Request):
         freq_opts=freq_opts,
         freq_opts_all=freq_opts_all,
         max_chars=DEFAULT_MAX_CHARS,
+        user_email=email,
+        admin_badge=admin_badge,
     ))
 
 
@@ -599,6 +743,9 @@ footer{{border-top:1px solid var(--border);padding:1rem 1.5rem;
     <span id="h-smtp" style="color:var(--muted);">確認中...</span>
     <div class="hdr-div"></div>
     <span id="h-summ" style="color:var(--muted);">要約: —</span>
+    <div class="hdr-div"></div>
+    {admin_badge}<span style="color:var(--t2);font-size:.76rem;">{user_email}</span>
+    <a href="/logout" style="color:var(--muted);font-size:.75rem;padding:.2rem .6rem;border:1px solid var(--border);border-radius:6px;margin-left:.4rem;">ログアウト</a>
   </div>
 </header>
 
@@ -1316,6 +1463,14 @@ async function checkStatus() {{
 
 /* ── Init ─────────────────────────────────────────────────────── */
 $('filter-freq').addEventListener('change', loadSubs);
+// ログインユーザーのメールを配信先フィールドに自動セット
+(function() {{
+  const me = '{user_email}';
+  const emailField = $('f-email');
+  if (me && emailField && !emailField.value) {{
+    emailField.value = me;
+  }}
+}})();
 loadSubs();
 loadHistStats();
 checkStatus();
@@ -1324,3 +1479,76 @@ setInterval(loadSubs, 30000);
 </body>
 </html>
 """
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ログインページ HTML
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _build_login_html(sent: str = "", error: str = "") -> str:
+    """ログインページ HTML を組み立てる。"""
+    sent_msg = (
+        '<div class="msg-ok">&#x2705; ログインリンクを送信しました。メールをご確認ください。</div>'
+        if sent == "1" else ""
+    )
+    error_msg = (
+        f'<div class="msg-err">&#x26A0; {error}</div>'
+        if error else ""
+    )
+    return f"""\
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>News Digest &#x2014; ログイン</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{{--bg:#080d1a;--s1:#0d1526;--s2:#131f35;--border:rgba(255,255,255,.07);
+  --text:#f1f5f9;--t2:#cbd5e1;--muted:#64748b;
+  --brand:#6366f1;--blight:#818cf8;--r:14px;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
+body{{background:var(--bg);color:var(--text);font-family:'Inter','Segoe UI',system-ui,sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem;}}
+.card{{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);
+  padding:2.5rem;width:100%;max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.5);}}
+.logo{{display:flex;align-items:center;gap:.6rem;font-size:1.1rem;font-weight:800;
+  margin-bottom:2rem;justify-content:center;}}
+.logo-icon{{width:36px;height:36px;border-radius:9px;
+  background:linear-gradient(135deg,#6366f1,#06b6d4);
+  display:flex;align-items:center;justify-content:center;font-size:1.1rem;}}
+h2{{font-size:1.4rem;font-weight:700;margin-bottom:.4rem;text-align:center;}}
+.sub{{color:var(--muted);font-size:.85rem;text-align:center;margin-bottom:1.8rem;}}
+label{{display:block;font-size:.8rem;font-weight:500;color:var(--t2);margin-bottom:.4rem;}}
+input[type=email]{{width:100%;background:var(--s2);border:1px solid var(--border);color:var(--text);
+  border-radius:9px;padding:.75rem 1rem;font-size:.9rem;outline:none;transition:border-color .2s;}}
+input[type=email]:focus{{border-color:var(--brand);box-shadow:0 0 0 3px rgba(99,102,241,.18);}}
+.btn{{width:100%;margin-top:1rem;padding:.85rem;background:var(--brand);
+  color:#fff;border:none;border-radius:9px;font-size:.95rem;font-weight:600;
+  cursor:pointer;transition:background .2s;}}
+.btn:hover{{background:var(--blight);}}
+.msg-ok{{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);
+  color:#6ee7b7;border-radius:9px;padding:.9rem 1rem;margin-bottom:1.2rem;
+  font-size:.85rem;text-align:center;}}
+.msg-err{{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);
+  color:#fca5a5;border-radius:9px;padding:.9rem 1rem;margin-bottom:1.2rem;
+  font-size:.85rem;text-align:center;}}
+.note{{color:var(--muted);font-size:.78rem;text-align:center;margin-top:1.4rem;line-height:1.6;}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><div class="logo-icon">&#x1F4F0;</div>News Digest</div>
+  <h2>ログイン</h2>
+  <p class="sub">メールアドレスを入力するとログインリンクをお送りします。</p>
+  {sent_msg}
+  {error_msg}
+  <form method="post" action="/login">
+    <label for="email">メールアドレス</label>
+    <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus>
+    <button class="btn" type="submit">ログインリンクを送信</button>
+  </form>
+  <p class="note">リンクは <strong>15 分間</strong> 有効です。<br>パスワードは不要です。</p>
+</div>
+</body>
+</html>"""

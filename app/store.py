@@ -74,68 +74,57 @@ class Store:
         return conn
 
     def _init_db(self) -> None:
+        _DDL_SUBS = """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id           TEXT PRIMARY KEY,
+                theme        TEXT NOT NULL,
+                email        TEXT NOT NULL,
+                owner_email  TEXT NOT NULL DEFAULT '',
+                frequency    TEXT NOT NULL DEFAULT 'daily',
+                count        INTEGER NOT NULL DEFAULT 5,
+                active       INTEGER NOT NULL DEFAULT 1,
+                created_at   REAL    NOT NULL,
+                last_sent_at REAL,
+                tags         TEXT    NOT NULL DEFAULT '[]'
+            )
+        """
+        _DDL_HIST = """
+            CREATE TABLE IF NOT EXISTS delivery_history (
+                id              TEXT PRIMARY KEY,
+                subscription_id TEXT,
+                theme           TEXT,
+                email           TEXT,
+                subject         TEXT,
+                item_count      INTEGER DEFAULT 0,
+                sent_at         REAL    NOT NULL,
+                success         INTEGER NOT NULL DEFAULT 0,
+                error           TEXT    DEFAULT '',
+                sources         TEXT    DEFAULT '[]'
+            )
+        """
         c = self._conn()
         if self._shared_conn is not None:
-            # shared conn: context manager は使わず直接 execute する
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    id           TEXT PRIMARY KEY,
-                    theme        TEXT NOT NULL,
-                    email        TEXT NOT NULL,
-                    frequency    TEXT NOT NULL DEFAULT 'daily',
-                    count        INTEGER NOT NULL DEFAULT 5,
-                    active       INTEGER NOT NULL DEFAULT 1,
-                    created_at   REAL    NOT NULL,
-                    last_sent_at REAL,
-                    tags         TEXT    NOT NULL DEFAULT '[]'
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS delivery_history (
-                    id              TEXT PRIMARY KEY,
-                    subscription_id TEXT,
-                    theme           TEXT,
-                    email           TEXT,
-                    subject         TEXT,
-                    item_count      INTEGER DEFAULT 0,
-                    sent_at         REAL    NOT NULL,
-                    success         INTEGER NOT NULL DEFAULT 0,
-                    error           TEXT    DEFAULT '',
-                    sources         TEXT    DEFAULT '[]'
-                )
-            """)
+            c.execute(_DDL_SUBS)
+            c.execute(_DDL_HIST)
             c.execute("CREATE INDEX IF NOT EXISTS idx_hist_sent ON delivery_history(sent_at DESC)")
             c.commit()
-            return
-        with c:
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    id           TEXT PRIMARY KEY,
-                    theme        TEXT NOT NULL,
-                    email        TEXT NOT NULL,
-                    frequency    TEXT NOT NULL DEFAULT 'daily',
-                    count        INTEGER NOT NULL DEFAULT 5,
-                    active       INTEGER NOT NULL DEFAULT 1,
-                    created_at   REAL    NOT NULL,
-                    last_sent_at REAL,
-                    tags         TEXT    NOT NULL DEFAULT '[]'
-                )
-            """)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS delivery_history (
-                    id              TEXT PRIMARY KEY,
-                    subscription_id TEXT,
-                    theme           TEXT,
-                    email           TEXT,
-                    subject         TEXT,
-                    item_count      INTEGER DEFAULT 0,
-                    sent_at         REAL    NOT NULL,
-                    success         INTEGER NOT NULL DEFAULT 0,
-                    error           TEXT    DEFAULT '',
-                    sources         TEXT    DEFAULT '[]'
-                )
-            """)
-            c.execute("CREATE INDEX IF NOT EXISTS idx_hist_sent ON delivery_history(sent_at DESC)")
+        else:
+            with c:
+                c.execute(_DDL_SUBS)
+                c.execute(_DDL_HIST)
+                c.execute("CREATE INDEX IF NOT EXISTS idx_hist_sent ON delivery_history(sent_at DESC)")
+        # 既存 DB への owner_email カラム追加（ALTER TABLE は冪等）
+        self._migrate_owner_email()
+
+    def _migrate_owner_email(self) -> None:
+        """既存 DB に owner_email カラムが無ければ追加する（冪等）。"""
+        try:
+            with self._conn() as c:
+                c.execute("ALTER TABLE subscriptions ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''")
+                # 既存行: 配信先アドレスをそのまま owner と仮定
+                c.execute("UPDATE subscriptions SET owner_email = email WHERE owner_email = ''")
+        except sqlite3.OperationalError:
+            pass  # カラムが既に存在する場合は無視
 
     # ── Subscription CRUD ────────────────────────────────────────────
 
@@ -146,25 +135,35 @@ class Store:
         frequency: str = "daily",
         count: int = 5,
         tags: Optional[List[str]] = None,
+        owner_email: str = "",
     ) -> Subscription:
         sub = Subscription(
             id=uuid.uuid4().hex[:12],
             theme=theme, email=email, frequency=frequency, count=count,
             created_at=time.time(), tags=tags or [],
+            owner_email=owner_email or email,
         )
         with self._conn() as c:
             c.execute(
-                "INSERT INTO subscriptions VALUES (?,?,?,?,?,?,?,?,?)",
-                (sub.id, sub.theme, sub.email, sub.frequency, sub.count,
-                 1, sub.created_at, None, json.dumps(sub.tags)),
+                "INSERT INTO subscriptions VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (sub.id, sub.theme, sub.email, sub.owner_email,
+                 sub.frequency, sub.count, 1, sub.created_at,
+                 None, json.dumps(sub.tags)),
             )
         return sub
 
-    def list_all(self) -> List[Subscription]:
+    def list_all(self, owner: Optional[str] = None) -> List[Subscription]:
+        """購読一覧を返す。owner を指定すると owner_email でフィルタする。"""
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT * FROM subscriptions ORDER BY created_at DESC"
-            ).fetchall()
+            if owner:
+                rows = c.execute(
+                    "SELECT * FROM subscriptions WHERE owner_email=? ORDER BY created_at DESC",
+                    (owner,),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM subscriptions ORDER BY created_at DESC"
+                ).fetchall()
         return [self._row_to_sub(r) for r in rows]
 
     def get(self, sub_id: str) -> Optional[Subscription]:
@@ -245,12 +244,14 @@ class Store:
         return count
 
     def _row_to_sub(self, row: sqlite3.Row) -> Subscription:
+        keys = row.keys()
         return Subscription(
             id=row["id"], theme=row["theme"], email=row["email"],
             frequency=row["frequency"], count=row["count"],
             active=bool(row["active"]), created_at=row["created_at"],
             last_sent_at=row["last_sent_at"],
             tags=json.loads(row["tags"] or "[]"),
+            owner_email=row["owner_email"] if "owner_email" in keys else "",
         )
 
     # ── Delivery History ─────────────────────────────────────────────

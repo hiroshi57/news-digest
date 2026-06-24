@@ -233,40 +233,133 @@ class TestNewsSearcher:
 # ════════════════════════════════════════════════════════════════════
 
 
+TEST_USER_EMAIL = "testuser@example.com"
+TEST_ADMIN_EMAIL = "admin@example.com"
+
+
+def _make_session_cookie(email: str) -> str:
+    """テスト用セッション Cookie 値を生成する。"""
+    from app.auth import make_session_token
+    return make_session_token(email)
+
+
 @pytest.fixture()
-def client():
-    """TestClient を返す。DB は in-memory、外部 I/O はモック。"""
-    from unittest.mock import patch, MagicMock
+def raw_client():
+    """認証なしの TestClient（/health などのパブリックエンドポイント用）。"""
+    from unittest.mock import MagicMock
     from fastapi.testclient import TestClient
     from app.main import create_app
 
     _app = create_app()
-
-    # DuckDuckGo を呼ばないようにする
     mock_searcher = MagicMock()
     mock_searcher.search.return_value = [
         SearchResult("テストタイトル", "https://example.com", "本文テスト", "NHK", "2026-06-24")
     ]
-
-    # SMTP を呼ばないようにする
     mock_mailer = MagicMock()
     mock_mailer.is_configured = False
 
     with TestClient(_app) as c:
-        c.app.state.searcher = mock_searcher  # type: ignore[union-attr]
-        c.app.state.mailer   = mock_mailer    # type: ignore[union-attr]
-        # engine の依存も差し替え
-        engine = c.app.state.engine           # type: ignore[union-attr]
+        c.app.state.searcher = mock_searcher
+        c.app.state.mailer   = mock_mailer
+        engine = c.app.state.engine
         engine.searcher = mock_searcher
         engine.mailer   = mock_mailer
         yield c
 
 
+@pytest.fixture()
+def client():
+    """一般ユーザーとしてログイン済みの TestClient。"""
+    from unittest.mock import MagicMock
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from app.auth import SESSION_COOKIE
+
+    _app = create_app()
+    mock_searcher = MagicMock()
+    mock_searcher.search.return_value = [
+        SearchResult("テストタイトル", "https://example.com", "本文テスト", "NHK", "2026-06-24")
+    ]
+    mock_mailer = MagicMock()
+    mock_mailer.is_configured = False
+
+    with TestClient(_app) as c:
+        c.app.state.searcher = mock_searcher
+        c.app.state.mailer   = mock_mailer
+        engine = c.app.state.engine
+        engine.searcher = mock_searcher
+        engine.mailer   = mock_mailer
+        # セッション Cookie を設定
+        c.cookies.set(SESSION_COOKIE, _make_session_cookie(TEST_USER_EMAIL))
+        yield c
+
+
+@pytest.fixture()
+def admin_client():
+    """管理者としてログイン済みの TestClient。"""
+    from unittest.mock import MagicMock
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    from app.auth import SESSION_COOKIE
+
+    _app = create_app()
+    mock_searcher = MagicMock()
+    mock_searcher.search.return_value = [
+        SearchResult("テストタイトル", "https://example.com", "本文テスト", "NHK", "2026-06-24")
+    ]
+    mock_mailer = MagicMock()
+    mock_mailer.is_configured = False
+
+    with TestClient(_app, base_url="http://testserver") as c:
+        c.app.state.searcher = mock_searcher
+        c.app.state.mailer   = mock_mailer
+        engine = c.app.state.engine
+        engine.searcher = mock_searcher
+        engine.mailer   = mock_mailer
+        # 管理者セッション Cookie + ADMIN_EMAIL を設定
+        os.environ["ADMIN_EMAIL"] = TEST_ADMIN_EMAIL
+        c.cookies.set(SESSION_COOKIE, _make_session_cookie(TEST_ADMIN_EMAIL))
+        yield c
+    os.environ.pop("ADMIN_EMAIL", None)
+
+
 class TestHealthEndpoint:
-    def test_healthz(self, client) -> None:
-        resp = client.get("/health")
+    def test_healthz(self, raw_client) -> None:
+        resp = raw_client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+
+# ════════════════════════════════════════════════════════════════════
+# 認証テスト
+# ════════════════════════════════════════════════════════════════════
+
+class TestAuth:
+    def test_unauthenticated_subscription_returns_401(self, raw_client) -> None:
+        resp = raw_client.get("/v1/subscriptions")
+        assert resp.status_code == 401
+
+    def test_login_page_returns_html(self, raw_client) -> None:
+        resp = raw_client.get("/login")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers.get("content-type", "")
+        assert "ログイン" in resp.text
+
+    def test_magic_token_verify_redirects_to_dashboard(self, raw_client) -> None:
+        from app.auth import make_magic_token
+        token = make_magic_token("newuser@example.com")
+        resp = raw_client.get(f"/auth/verify?token={token}", follow_redirects=False)
+        assert resp.status_code in (302, 303)
+        assert "/dashboard" in resp.headers.get("location", "")
+
+    def test_invalid_token_redirects_to_login(self, raw_client) -> None:
+        resp = raw_client.get("/auth/verify?token=invalidtoken", follow_redirects=False)
+        assert resp.status_code in (302, 303)
+        assert "/login" in resp.headers.get("location", "")
+
+    def test_logout_clears_cookie(self, client) -> None:
+        resp = client.get("/logout", follow_redirects=False)
+        assert resp.status_code in (302, 303)
 
 
 class TestSubscriptionEndpoints:
@@ -282,18 +375,40 @@ class TestSubscriptionEndpoints:
         assert data["theme"] == "テストAI"
         assert data["email"] == "test@example.com"
         assert "id" in data
+        assert data["owner_email"] == TEST_USER_EMAIL
 
     def test_list_subscriptions(self, client) -> None:
         client.post("/v1/subscriptions", json={
-            "theme": "経済", "email": "a@example.com", "frequency": "daily", "count": 3
+            "theme": "経済", "email": TEST_USER_EMAIL, "frequency": "daily", "count": 3
         })
         resp = client.get("/v1/subscriptions")
         assert resp.status_code == 200
-        assert isinstance(resp.json(), list)
+        data = resp.json()
+        assert isinstance(data, list)
+        # owner_email フィルタが効いているか確認
+        for s in data:
+            assert s["owner_email"] == TEST_USER_EMAIL
 
-    def test_delete_subscription(self, client) -> None:
+    def test_user_cannot_delete_others_subscription(self, client) -> None:
+        """同一アプリの別ユーザーセッションで 403 を確認する。"""
+        from app.auth import SESSION_COOKIE, make_session_token
+        # 別ユーザー (other@example.com) として購読を作成
+        other_cookie = make_session_token("other@example.com")
+        resp = client.post(
+            "/v1/subscriptions",
+            json={"theme": "他人テーマ", "email": "other@example.com",
+                  "frequency": "daily", "count": 3},
+            cookies={SESSION_COOKIE: other_cookie},
+        )
+        assert resp.status_code == 200
+        sid = resp.json()["id"]
+        # 自分 (TEST_USER_EMAIL) が削除しようとすると 403
+        del_resp = client.delete(f"/v1/subscriptions/{sid}")
+        assert del_resp.status_code == 403
+
+    def test_delete_own_subscription(self, client) -> None:
         create_resp = client.post("/v1/subscriptions", json={
-            "theme": "削除テスト", "email": "del@example.com", "frequency": "weekly", "count": 3
+            "theme": "削除テスト", "email": TEST_USER_EMAIL, "frequency": "weekly", "count": 3
         })
         sid = create_resp.json()["id"]
         del_resp = client.delete(f"/v1/subscriptions/{sid}")
