@@ -1,0 +1,23 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Pydantic v2 (FastAPI 0.111+ 同梱)
+pydantic>=2.7.0
+
+# News search
+# ddgs (旧 duckduckgo-search) を優先使用。jp-jp region は v0.x 系が対応
+ddgs>=0.1.0
+
+# DNS MX validation
+dnspython>=2.6.0
+
+# LLM summarizers (optional)
+anthropic>=0.28.0
+openai>=1.30.0
+
+# Email
+# smtplib は stdlib に含まれる
+
+# Cloud Run / scheduler (optional - for local dev)
+# google-cloud-scheduler>=2.13.0

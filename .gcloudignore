@@ -1,0 +1,16 @@
+.git
+.gitignore
+.gcloudignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite3
+.env
+.env.*
+tests/
+*.log
+.DS_Store
+Thumbs.db
